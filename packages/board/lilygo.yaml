@@ -6,6 +6,9 @@ substitutions:
   # Tion UART
   tx_pin: $usb_dp_pin
   rx_pin: $usb_dm_pin
+  # Brightness (0.0-1.0) of the calm status indication: green - OK, orange - filter worn out.
+  # Errors (red pulse) and warnings (blue pulse) always blink at full brightness.
+  status_led_brightness: "0.12"
 
 packages:
   # перенаправим лог на QWIIC-коннектор. подключение: GND ближе к USB-порту, TX через один.
@@ -42,7 +45,34 @@ globals:
     type: bool
     initial_value: "false"
 
+# Status LED indication:
+#   red slow pulse    - a component reports an error, e.g. no answer from the breezer (see tion.state_timeout)
+#   blue slow pulse   - a component reports a warning, e.g. WiFi/MQTT/API is not connected
+#   dim green         - everything is fine
+#   dim orange        - the breezer asks to replace the filters
+#   off               - "Status LED" switch is off (errors and warnings are still shown)
+switch:
+  - platform: template
+    id: lilygo_status_led
+    name: Status LED
+    icon: mdi:led-on
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - script.execute: lilygo_status_led_refresh
+    on_turn_off:
+      - script.execute: lilygo_status_led_refresh
+
 binary_sensor:
+  - platform: tion
+    id: lilygo_status_led_filter
+    type: filter
+    name: Status LED Filter
+    internal: true
+    on_state:
+      - script.execute: lilygo_status_led_refresh
+
   - platform: gpio
     id: g_button
     pin:
@@ -85,13 +115,44 @@ binary_sensor:
               auto call = id(statusledlight).turn_off();
               call.perform();
 
+script:
+  - id: lilygo_status_led_refresh
+    mode: restart
+    then:
+      - lambda: |-
+          if (id(factory_reset_action)) {
+            return;  // the LED is driven by the button handler
+          }
+          const uint32_t app_state = App.get_app_state();
+          auto call = id(statusledlight).turn_on();
+          if (app_state & STATUS_LED_ERROR) {
+            call.set_rgb(1.0, 0.0, 0.0);
+            call.set_brightness(1.0);
+            call.set_effect("slow_pulse");
+          } else if (app_state & STATUS_LED_WARNING) {
+            call.set_rgb(0.0, 0.0, 1.0);
+            call.set_brightness(1.0);
+            call.set_effect("slow_pulse");
+          } else if (!id(lilygo_status_led).state) {
+            call = id(statusledlight).turn_off();
+          } else if (id(lilygo_status_led_filter).state) {
+            call.set_rgb(1.0, 0.35, 0.0);
+            call.set_brightness($status_led_brightness);
+            call.set_effect("none");
+          } else {
+            call.set_rgb(0.0, 1.0, 0.0);
+            call.set_brightness($status_led_brightness);
+            call.set_effect("none");
+          }
+          call.perform();
+
 esphome:
   on_loop:
     - lambda: |-
-        static uint32_t app_state = 0;
+        static uint32_t app_state = UINT32_MAX;
 
         if (id(factory_reset_action)) {
-          app_state = 0;
+          app_state = UINT32_MAX;  // re-apply the indication after the button handler releases the LED
           return;
         }
 
@@ -99,25 +160,7 @@ esphome:
           return;
         }
         app_state = App.get_app_state();
-
-        if (app_state & STATUS_LED_ERROR) {
-            auto call = id(statusledlight).turn_on();
-            call.set_rgb(1.0, 0.0, 0.0);
-            call.set_effect("slow_pulse");
-            call.perform();
-            return;
-        }
-
-        if (app_state & STATUS_LED_WARNING) {
-            auto call = id(statusledlight).turn_on();
-            call.set_rgb(0.0, 0.0, 1.0);
-            call.set_effect("slow_pulse");
-            call.perform();
-            return;
-        }
-
-        auto call = id(statusledlight).turn_off();
-        call.perform();
+        id(lilygo_status_led_refresh).execute();
 
 # this code initializes at startup once so do not use components that use some memory and CPU
 setup:
